@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# DOTYCAT-style VPS Dashboard + Web Panel Installer
+# Version: 1.3.0
+# OS: Ubuntu 22.04 / Debian 11
+# Author: DOTYCAT TEAM
+# Website: WWW.DOTYCAT.COM
+
+set -euo pipefail
+BASE_DIR="/opt/vps-dashboard"
+USER_DB="/etc/vps_users.csv"
+XDIR="/usr/local/bin"
+WEB_DIR="$BASE_DIR/webpanel"
+
+log(){ echo -e "[\e[1;32mOK\e[0m] $*"; }
+info(){ echo -e "[\e[1;34m..\e[0m] $*"; }
+err(){ echo -e "[\e[1;31mERR\e[0m] $*" >&2; }
+
+require_root(){ [ "$EUID" -ne 0 ] && { err "Run as root"; exit 1; } }
+mkdir_if(){ [ -d "$1" ] || mkdir -p "$1"; }
+init_user_db(){ [ ! -f "$USER_DB" ] && echo "username,uuid,quota_gb,expire_date,protocol,created_at" >$USER_DB && chmod 600 $USER_DB && log "User DB initialized"; }
+add_user(){ read -rp "Username: " u; grep -qi "^$u," $USER_DB && { err "User exists"; return; }; uuid=$(cat /proc/sys/kernel/random/uuid); read -rp "Quota (GB, 0=unlimited): " q; read -rp "Expire date (YYYY-MM-DD or 0=never): " e; read -rp "Protocol (vless/vmess/ssh/trojan/socks): " p; created=$(date +%F); echo "$u,$uuid,$q,$e,$p,$created" >>$USER_DB; log "User $u added"; }
+del_user(){ read -rp "Username to delete: " u; grep -qi "^$u," $USER_DB || { err "User not found"; return; }; sed -i "/^$u,/Id" $USER_DB; log "User $u removed"; }
+list_users(){ column -t -s, $USER_DB | sed -n '2,$p'; }
+cleanup_expired(){ today=$(date +%F); awk -F, 'NR==1{print;next} {if($4=="0"||$4>"'"$today"'"){print} else {print "EXPIRE,"$0 > "/tmp/expired_users.txt"}}' $USER_DB >$USER_DB.new; mv $USER_DB.new $USER_DB; [ -f /tmp/expired_users.txt ] && log "Expired users moved to /tmp/expired_users.txt"; }
+user_menu(){ while true; do clear; echo "---- User Management ----"; echo "1) Add user"; echo "2) Delete user"; echo "3) List users"; echo "4) Cleanup expired users"; echo "0) Back"; read -rp "Choose: " u; case $u in 1) add_user;;2) del_user;;3) list_users; read -rp "Press Enter...";;4) cleanup_expired;;0) return;;*) echo "Invalid"; sleep 1;; esac; done; }
+install_base(){ info "Installing base packages..."; apt-get update -y; apt-get upgrade -y; apt-get install -y curl wget git unzip lsb-release net-tools htop screen bash-completion ufw python3 python3-pip; log "Base packages installed"; }
+install_nginx(){ info "Installing NGINX..."; apt-get install -y nginx; systemctl enable --now nginx; log "NGINX installed"; }
+install_xray(){ info "Installing XRay..."; mkdir_if "$BASE_DIR"; XR_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$(uname -m).zip"; tmp="/tmp/xray.zip"; curl -L -o "$tmp" "$XR_URL"; unzip -o "$tmp" -d /tmp/xray >/dev/null; install -m 755 /tmp/xray/xray "$XDIR/xray"; mkdir_if /etc/xray; cat >/etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=XRay Service
+After=network.target
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+ systemctl daemon-reload; systemctl enable --now xray || true; log "XRay installed"; }
+write_sample_xray_config(){ info "Writing sample XRay JSON config"; mkdir_if /etc/xray; cat >/etc/xray/config.json <<'EOF'
+{
+  "inbounds":[{"port":80,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":"00000000-0000-0000-0000-000000000000","flow":""}]},"streamSettings":{"network":"ws","wsSettings":{"path":"/vless"}}}],
+  "outbounds":[{"protocol":"freedom","settings":{}}]
+}
+EOF
+ log "Sample XRay config written"; }
+install_slowdns(){ info "Installing SlowDNS..."; SD_URL="https://github.com/AdguardTeam/SlowDNS/releases/latest/download/slowdns-linux-$(uname -m)"; mkdir_if /opt/slowdns; curl -L -o /opt/slowdns/slowdns "$SD_URL"; chmod +x /opt/slowdns/slowdns; log "SlowDNS installed"; }
+install_webpanel(){ info "Installing Web Panel..."; mkdir_if "$WEB_DIR"; cat > $WEB_DIR/app.py <<'EOF'
+from flask import Flask
+app = Flask(__name__)
+@app.route('/')
+def index():
+    return '<h1>DOTYCAT VPS WEB PANEL</h1><p>Manage users & services here.</p>'
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=8080)
+EOF
+ python3 -m pip install flask >/dev/null 2>&1; ufw allow 8080/tcp; log "Web Panel installed at port 8080"; }
+start_webpanel(){ info "Starting Web Panel..."; nohup python3 $WEB_DIR/app.py >/dev/null 2>&1 & log "Web Panel running on port 8080"; }
+main_menu(){ while true; do clear; echo "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"; echo "┃   VPS Dashboard - DOTYCAT Style                     ┃"; echo "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"; echo; echo "[01] SSH/WS MENU"; echo "[02] VMESS MENU"; echo "[03] VLESS MENU"; echo "[04] TROJAN MENU"; echo "[05] SOCKS MENU"; echo "[06] User management"; echo "[07] SlowDNS → install automatically"; echo; echo "Tools:"; echo "[08] DNS PANEL"; echo "[09] DOMAIN PANEL"; echo "[10] NETGUARD PANEL"; echo "[11] VPN PORT INFO"; echo "[12] CLEAN VPS LOGS"; echo "[13] VPS STATUS"; echo "[14] WEB PANEL"; echo "[00] EXIT"; read -rp "Choose: " c; case $c in 1) echo "SSH/WS MENU selected"; sleep 2;;2) echo "VMESS MENU selected"; sleep 2;;3) echo "VLESS MENU selected"; sleep 2;;4) echo "TROJAN MENU selected"; sleep 2;;5) echo "SOCKS MENU selected"; sleep 2;;6) user_menu;;7) install_slowdns;;8) echo "DNS PANEL"; sleep 2;;9) echo "DOMAIN PANEL"; sleep 2;;10) echo "NETGUARD PANEL"; sleep 2;;11) echo "VPN PORT INFO"; sleep 2;;12) echo "CLEAN VPS LOGS"; sleep 2;;13) echo "VPS STATUS"; sleep 2;;14) install_webpanel; start_webpanel;;0) exit 0;;*) echo "Invalid"; sleep 1;; esac; done; }
+
+require_root; mkdir_if $BASE_DIR; init_user_db; install_base; install_nginx; install_xray; write_sample_xray_config; main_menu
