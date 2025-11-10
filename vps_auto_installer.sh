@@ -12,6 +12,76 @@ BASE_DIR="/opt/vps-installer"
 USER_DB="/etc/vps_users.csv"
 XDIR="/usr/local/bin"
 
+#!/usr/bin/env bash
+# vps_auto_installer.sh
+# Linux-ready VPS Auto Installer (Ubuntu + Debian)
+# Features: base tools, Nginx+PHP+MariaDB (optional), XRay, SlowDNS, UDP helper, user management, interactive menu
+# Line endings converted to LF for Linux
+
+set -euo pipefail
+LANG=C
+BASE_DIR="/opt/vps-installer"
+USER_DB="/etc/vps_users.csv"
+XDIR="/usr/local/bin"
+
+log(){ echo -e "[\e[1;32mOK\e[0m] $*"; }
+err(){ echo -e "[\e[1;31mERR\e[0m] $*" >&2; }
+info(){ echo -e "[\e[1;34m..\e[0m] $*"; }
+
+require_root(){ if [ "$EUID" -ne 0 ]; then err "This script must be run as root."; exit 1; fi }
+mkdir_if(){ [ -d "$1" ] || mkdir -p "$1"; }
+
+detect_os(){
+  if [ -f /etc/os-release ]; then . /etc/os-release; OS_NAME="$ID"; OS_VER="$VERSION_ID"; else err "Unsupported OS"; exit 1; fi
+  info "Detected OS: $OS_NAME $OS_VER"
+  case "$OS_NAME" in ubuntu|debian) ;; *) err "Supports Ubuntu/Debian only"; exit 1;; esac
+}
+
+apt_update(){ export DEBIAN_FRONTEND=noninteractive; apt-get update -y; apt-get upgrade -y; }
+install_base(){ info "Installing base packages..."; apt-get install -y curl wget git ca-certificates lsb-release apt-transport-https jq unzip net-tools screen htop bash-completion ufw fail2ban python3 python3-pip; log "Base packages installed"; }
+install_web_stack(){ read -rp "Install web stack (Nginx + PHP + MariaDB)? [y/N]: " yn; yn=${yn:-N}; if [[ "$yn" =~ ^[Yy]$ ]]; then info "Installing Nginx..."; apt-get install -y nginx; systemctl enable --now nginx; info "Installing PHP..."; apt-get install -y php-fpm php-cli php-mysql php-curl php-xml php-mbstring; systemctl enable --now php*-fpm || true; info "Installing MariaDB..."; apt-get install -y mariadb-server; systemctl enable --now mariadb; log "Web stack installed"; else info "Skipping web stack"; fi }
+install_xray(){ info "Installing XRay core..."; mkdir_if "$BASE_DIR"; XR_URL="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-$(uname -m).zip"; tmp="/tmp/xray.zip"; curl -L -o "$tmp" "$XR_URL"; unzip -o "$tmp" -d /tmp/xray >/dev/null; install -m 755 /tmp/xray/xray "$XDIR/xray"; mkdir_if /etc/xray; cat >/etc/systemd/system/xray.service <<'EOF'
+[Unit]
+Description=XRay Service
+After=network.target
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xray run -config /etc/xray/config.json
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+ systemctl daemon-reload; systemctl enable --now xray || true; log "XRay installed. Default config at /etc/xray/config.json"; }
+write_sample_xray_config(){ info "Writing sample XRay JSON config"; mkdir_if /etc/xray; cat >/etc/xray/config.json <<'EOF'
+{
+  "inbounds":[{"port":80,"listen":"127.0.0.1","protocol":"vless","settings":{"clients":[{"id":"00000000-0000-0000-0000-000000000000","flow":""}]},"streamSettings":{"network":"ws","wsSettings":{"path":"/vless"}}}],
+  "outbounds":[{"protocol":"freedom","settings":{}}]
+}
+EOF
+ log "Sample XRay config written"; }
+install_slowdns(){ info "Installing SlowDNS helper..."; SD_URL="https://github.com/AdguardTeam/SlowDNS/releases/latest/download/slowdns-linux-$(uname -m)"; mkdir_if /opt/slowdns; curl -L -o /opt/slowdns/slowdns "$SD_URL" || err "Manual install needed"; chmod +x /opt/slowdns/slowdns; log "SlowDNS installed"; }
+install_udp_helper(){ info "Installing badvpn-udpgw..."; apt-get install -y cmake build-essential libssl-dev || true; mkdir_if /opt/badvpn; cd /tmp; [ ! -f badvpn-1.999.130.tar.gz ] && wget -q https://github.com/ambrop72/badvpn/archive/refs/tags/1.999.130.tar.gz; tar xzf badvpn-1.999.130.tar.gz; cd badvpn-1.999.130; cmake -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 . && make -j2 || true; install -m 755 badvpn-udpgw /usr/local/bin/badvpn-udpgw; cat >/etc/systemd/system/badvpn-udpgw.service <<'EOF'
+[Unit]
+Description=badvpn udpgw
+After=network.target
+[Service]
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300 --max-clients 1024
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+ systemctl daemon-reload; systemctl enable --now badvpn-udpgw || true; log "badvpn-udpgw installed and running"; }
+init_user_db(){ [ ! -f "$USER_DB" ] && echo "username,uuid,quota_gb,expire_date,protocol,created_at" >$USER_DB && chmod 600 $USER_DB && log "User DB initialized"; }
+add_user(){ read -rp "Username: " u; grep -qi "^$u," $USER_DB && { err "User exists"; return; }; uuid=$(cat /proc/sys/kernel/random/uuid); read -rp "Quota (GB, 0=unlimited): " q; read -rp "Expire date (YYYY-MM-DD or 0=never): " e; read -rp "Protocol (vless/vmess/ssh/trojan/socks): " p; created=$(date +%F); echo "$u,$uuid,$q,$e,$p,$created" >>$USER_DB; log "User $u added"; }
+del_user(){ read -rp "Username to delete: " u; grep -qi "^$u," $USER_DB || { err "User not found"; return; }; sed -i "/^$u,/Id" $USER_DB; log "User $u removed"; }
+list_users(){ column -t -s, $USER_DB | sed -n '2,$p'; }
+cleanup_expired(){ today=$(date +%F); awk -F, 'NR==1{print;next} {if($4=="0"||$4>"'"$today"'"){print} else {print "EXPIRE,"$0 > "/tmp/expired_users.txt"}}' $USER_DB >$USER_DB.new; mv $USER_DB.new $USER_DB; [ -f /tmp/expired_users.txt ] && log "Expired users moved to /tmp/expired_users.txt"; }
+user_menu(){ while true; do clear; echo "---- User Management ----"; echo "1) Add user"; echo "2) Delete user"; echo "3) List users"; echo "4) Cleanup expired users"; echo "0) Back"; read -rp "Choose: " u; case $u in 1) add_user;;2) del_user;;3) list_users; read -rp "Press Enter...";;4) cleanup_expired;;0) return;;*) echo "Invalid"; sleep 1;; esac; done; }
+main_menu(){ while true; do clear; echo "=============================================="; echo "  VPS Auto Installer — Ubuntu / Debian"; echo "=============================================="; echo "1) Update & install base packages"; echo "2) Install web stack (Nginx/PHP/MariaDB)"; echo "3) Install XRay core"; echo "4) Write sample XRay config"; echo "5) Install SlowDNS helper"; echo "6) Install UDP helper (badvpn-udpgw)"; echo "7) User management"; echo "8) Show services status"; echo "9) Initialize user DB"; echo "0) Exit"; read -rp "Choose: " c; case $c in 1) apt_update; install_base;;2) install_web_stack;;3) install_xray;;4) write_sample_xray_config;;5) install_slowdns;;6) install_udp_helper;;7) user_menu;;8) systemctl status nginx xray badvpn-udpgw mariadb --no-pager || true;;9) init_user_db;;0) exit 0;;*) echo "Invalid"; sleep 1;; esac; echo; read -rp "Press Enter to continue..." dummy; done; }
+require_root; detect_os; mkdir_if $BASE_DIR; init_user_db; main_menu
+
+
+
 # ---------- Helpers ----------
 log(){ echo -e "[\e[1;32mOK\e[0m] $*"; }
 err(){ echo -e "[\e[1;31mERR\e[0m] $*" >&2; }
